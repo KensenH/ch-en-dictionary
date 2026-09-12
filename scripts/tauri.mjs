@@ -1,4 +1,7 @@
 import { spawn } from "node:child_process";
+import { createRequire } from "node:module";
+
+const require = createRequire(import.meta.url);
 
 const environment = { ...process.env };
 
@@ -12,8 +15,11 @@ if (process.platform === "linux") {
   environment.CXXFLAGS = flags.join(" ");
 }
 
-const command = process.platform === "win32" ? "tauri.cmd" : "tauri";
-const child = spawn(command, process.argv.slice(2), {
+// Invoke the CLI entry point with Node instead of spawning the platform shim.
+// In particular, Node 22 can reject direct `.cmd` execution on Windows with
+// `spawn EINVAL`.
+const tauriCli = require.resolve("@tauri-apps/cli/tauri.js");
+const child = spawn(process.execPath, [tauriCli, ...process.argv.slice(2)], {
   env: environment,
   stdio: "inherit",
 });
