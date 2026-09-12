@@ -20,10 +20,9 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 tauri = { version = "2", features = [] }
 serde = { version = "1", features = ["derive"] }
-rusqlite = "0.38.0"
+rusqlite = { version = "0.38.0", features = ["bundled"] }
 anyhow = "1.0.102"
 image = "0.25.9"
 arboard = { version = "3.6.1", features = ["wayland-data-control"] }
 ocr-rs = "2.0.2"
 md-5 = "0.10.6"
-
