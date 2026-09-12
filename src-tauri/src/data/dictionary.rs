@@ -28,7 +28,14 @@ impl DictionaryRepoTrait for DictionaryRepo {
             );
         }
 
-        query_str.push_str(" ORDER BY w_cd DESC LIMIT 20");
+        if query.is_empty() {
+            query_str.push_str(" ORDER BY w_cd DESC, id ASC LIMIT 20");
+        } else {
+            query_str.push_str(
+                " ORDER BY (traditional_character = $1 OR simplified_character = $1) DESC,
+                  w_cd DESC, id ASC LIMIT 20",
+            );
+        }
 
         let mut stmt = conn.prepare(query_str.as_str())?;
 
@@ -64,7 +71,19 @@ impl DictionaryRepoTrait for DictionaryRepo {
             query_str.push_str(" WHERE cedict_dictionary_fts MATCH $1");
         }
 
-        query_str.push_str(" ORDER BY cd.w_cd DESC, rank ASC LIMIT 20");
+        if query.is_empty() {
+            query_str.push_str(" ORDER BY cd.w_cd DESC, cd.id ASC LIMIT 20");
+        } else {
+            // A complete slash-delimited translation beats an incidental mention.
+            // Popularity orders direct translations; FTS relevance orders other matches.
+            query_str.push_str(
+                " ORDER BY
+                  (instr('/' || lower(replace(replace(cd.definition, '!', ''), '?', '')) || '/', '/' || $2 || '/') > 0) DESC,
+                  CASE WHEN instr('/' || lower(replace(replace(cd.definition, '!', ''), '?', '')) || '/', '/' || $2 || '/') > 0
+                       THEN coalesce(cd.w_cd, 0) END DESC,
+                  rank ASC, cd.w_cd DESC, cd.id ASC LIMIT 20",
+            );
+        }
 
         let mut stmt = conn.prepare(query_str.as_str())?;
 
@@ -72,7 +91,10 @@ impl DictionaryRepoTrait for DictionaryRepo {
         let rows = if query.is_empty() {
             stmt.query_map([], map_word)?
         } else {
-            stmt.query_map(params_from_iter([fts_query.as_str()]), map_word)?
+            stmt.query_map(
+                params_from_iter([fts_query.as_str(), query.to_lowercase().as_str()]),
+                map_word,
+            )?
         };
 
         let result: Vec<Word> = rows.collect::<Result<Vec<_>, _>>()?;
@@ -122,7 +144,7 @@ mod tests {
                     simplified_character TEXT NOT NULL,
                     pinyin TEXT NOT NULL,
                     definition TEXT NOT NULL,
-                    w_cd INTEGER NOT NULL
+                    w_cd INTEGER
                 );
                 CREATE VIRTUAL TABLE cedict_dictionary_fts USING fts5(
                     pinyin,
@@ -139,6 +161,85 @@ mod tests {
             .unwrap();
 
         DictionaryRepo::new(connection)
+    }
+
+    fn add_entries(repo: &DictionaryRepo, entries: &str) {
+        repo.conn
+            .lock()
+            .unwrap()
+            .execute_batch(&format!(
+                "INSERT INTO cedict_dictionary
+             (id, traditional_character, simplified_character, pinyin, definition, w_cd)
+             VALUES {entries};
+             INSERT INTO cedict_dictionary_fts(cedict_dictionary_fts) VALUES ('rebuild');"
+            ))
+            .unwrap();
+    }
+
+    #[test]
+    fn exact_hanzi_precedes_popular_prefix_matches() {
+        let repo = test_repo();
+        add_entries(
+            &repo,
+            "(2, '書', '书', 'shu1', 'book', NULL),
+                            (3, '書店', '书店', 'shu1 dian4', 'bookshop', 9000)",
+        );
+        for query in ["书", "書"] {
+            let words = repo.search_by_hanzi(query).unwrap();
+            assert_eq!(words[0].simplified, "书");
+            assert_eq!(words[1].simplified, "书店");
+        }
+    }
+
+    #[test]
+    fn direct_translation_precedes_incidental_mentions_even_without_frequency() {
+        let repo = test_repo();
+        add_entries(
+            &repo,
+            "(2, '回', '回', 'hui2', 'chapter of a classic book', 9000),
+                            (3, '書', '书', 'shu1', 'letter/book/document', NULL)",
+        );
+        let words = repo.search_by_other("BOOK").unwrap();
+        assert_eq!(words[0].simplified, "书");
+        assert_eq!(words[1].simplified, "回");
+    }
+
+    #[test]
+    fn direct_greeting_ignores_terminal_punctuation() {
+        let repo = test_repo();
+        add_entries(
+            &repo,
+            "(2, '喂', '喂', 'wei2', 'hello (when answering the phone)', 9000),
+                            (3, '您好', '您好', 'nin2 hao3', 'Hello!/Hi!', 200)",
+        );
+        assert_eq!(repo.search_by_other("hello").unwrap()[0].simplified, "您好");
+    }
+
+    #[test]
+    fn popularity_orders_equally_direct_translations() {
+        let repo = test_repo();
+        add_entries(
+            &repo,
+            "(2, '蘋', '苹', 'ping2', 'apple', 28),
+                            (3, '蘋果', '苹果', 'ping2 guo3', 'apple/classifier note', 446)",
+        );
+        assert_eq!(repo.search_by_other("apple").unwrap()[0].simplified, "苹果");
+    }
+
+    #[test]
+    fn relevance_precedes_popularity_for_other_matches() {
+        let repo = test_repo();
+        add_entries(&repo, "(2, '甲', '甲', 'jia3', 'a book', NULL),
+                            (3, '乙', '乙', 'yi3', 'an incidental mention of a book in a long explanatory note', 9000)");
+        assert_eq!(repo.search_by_other("book").unwrap()[0].simplified, "甲");
+    }
+
+    #[test]
+    fn empty_search_keeps_popularity_order() {
+        let repo = test_repo();
+        add_entries(&repo, "(2, '書', '书', 'shu1', 'book', 9000)");
+        assert_eq!(repo.search_by_hanzi("").unwrap()[0].simplified, "书");
+        assert_eq!(repo.search_by_other("").unwrap()[0].simplified, "书");
     }
 
     #[test]
